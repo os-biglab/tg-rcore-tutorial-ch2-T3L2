@@ -23,5 +23,5 @@ runner = [
 # TG_USER_VERSION : 目标版本号
 [env]
 TG_USER_CRATE     = "tg-rcore-tutorial-user-T3L2"
-TG_USER_LOCAL_DIR = "../tg-rcore-tutorial-user-T3L2"
-TG_USER_VERSION   = "0.4.8"
+TG_USER_LOCAL_DIR = "tg-rcore-tutorial-user-T3L2"
+TG_USER_VERSION   = "0.0.1-preview.1"

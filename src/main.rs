@@ -70,6 +70,12 @@ const FRAMEBUFFER_BACKGROUND: u32 = 0xff1d2128;
 const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 #[cfg(target_arch = "riscv64")]
+const SYSCALL_RENDER_BLOCK: usize = 0x1000_0001;
+
+#[cfg(target_arch = "riscv64")]
+const NO_RENDER_REQUEST: usize = usize::MAX;
+
+#[cfg(target_arch = "riscv64")]
 #[repr(align(4096))]
 struct DmaPool([u8; DMA_POOL_PAGES * DMA_PAGE_SIZE]);
 
@@ -88,6 +94,10 @@ static mut KERNEL_HEAP: KernelHeap = KernelHeap([0; HEAP_SIZE]);
 #[cfg(target_arch = "riscv64")]
 static DMA_NEXT_PAGE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_arch = "riscv64")]
+static RENDER_REQUEST: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(NO_RENDER_REQUEST);
 
 #[cfg(target_arch = "riscv64")]
 struct SimpleHal;
@@ -215,9 +225,6 @@ extern "C" fn rust_main() -> ! {
         )
     };
 
-    #[cfg(target_arch = "riscv64")]
-    let mut rendered_blocks = 0usize;
-
     // 第四步：批处理——依次加载并运行每个用户程序
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let app_base = app.as_ptr() as usize;
@@ -234,9 +241,6 @@ extern "C" fn rust_main() -> ! {
         let user_stack_ptr = user_stack.as_mut_ptr() as *mut usize;
         // 将用户栈顶地址写入上下文的 sp 寄存器
         *ctx.sp_mut() = unsafe { user_stack_ptr.add(512) } as usize;
-
-        #[cfg(target_arch = "riscv64")]
-        let mut render_after_exit = false;
 
         // 循环执行用户程序，直到退出或出错
         loop {
@@ -256,10 +260,6 @@ extern "C" fn rust_main() -> ! {
                         Done => continue,           // 系统调用处理完成，继续执行
                         Exit(code) => {
                             log::info!("app{i} exit with code {code}");
-                            #[cfg(target_arch = "riscv64")]
-                            {
-                                render_after_exit = true;
-                            }
                         }
                         Error(id) => {
                             log::error!("app{i} call an unsupported syscall {}", id.0)
@@ -276,14 +276,14 @@ extern "C" fn rust_main() -> ! {
         }
 
         #[cfg(target_arch = "riscv64")]
-        if render_after_exit {
-            if rendered_blocks < tangram::BLOCK_COUNT {
-                let framebuffer = unsafe {
-                    core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len)
-                };
-                tangram::render_block(framebuffer, width, height, rendered_blocks);
+        {
+            use core::sync::atomic::Ordering;
+            let block = RENDER_REQUEST.swap(NO_RENDER_REQUEST, Ordering::AcqRel);
+            if block < tangram::BLOCK_COUNT {
+                let framebuffer =
+                    unsafe { core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len) };
+                tangram::render_block(framebuffer, width, height, block);
                 gpu.flush().expect("failed to flush framebuffer");
-                rendered_blocks += 1;
             }
         }
 
@@ -369,6 +369,19 @@ enum SyscallResult {
 /// 分发到对应的处理函数，并将返回值写回 a0 寄存器。
 fn handle_syscall(ctx: &mut LocalContext) -> SyscallResult {
     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        use core::sync::atomic::Ordering;
+        let id_raw = ctx.a(7);
+        if id_raw == SYSCALL_RENDER_BLOCK {
+            let block = ctx.a(0);
+            RENDER_REQUEST.store(block, Ordering::Release);
+            *ctx.a_mut(0) = 0;
+            ctx.move_next();
+            return SyscallResult::Done;
+        }
+    }
 
     // a7 寄存器存放 syscall ID
     let id = ctx.a(7).into();
