@@ -32,6 +32,8 @@ extern crate tg_console;
 
 // 本地模块：Console 和 SyscallContext 的实现
 use impls::{Console, SyscallContext};
+#[cfg(target_arch = "riscv64")]
+use virtio_drivers::{Hal, MmioTransport, PhysAddr, VirtAddr, VirtIOGpu, VirtIOHeader};
 // riscv 库：访问 RISC-V 控制状态寄存器（CSR），如 scause
 use riscv::register::*;
 // 日志模块
@@ -42,6 +44,94 @@ use tg_kernel_context::LocalContext;
 use tg_sbi;
 // 系统调用相关：调用者信息、系统调用 ID
 use tg_syscall::{Caller, SyscallId};
+
+#[cfg(target_arch = "riscv64")]
+mod tangram;
+
+#[cfg(target_arch = "riscv64")]
+const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+
+#[cfg(target_arch = "riscv64")]
+const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+
+#[cfg(target_arch = "riscv64")]
+const VIRTIO_MMIO_COUNT: usize = 8;
+
+#[cfg(target_arch = "riscv64")]
+const DMA_PAGE_SIZE: usize = 4096;
+
+#[cfg(target_arch = "riscv64")]
+const DMA_POOL_PAGES: usize = 2048;
+
+#[cfg(target_arch = "riscv64")]
+const FRAMEBUFFER_BACKGROUND: u32 = 0xff1d2128;
+
+#[cfg(target_arch = "riscv64")]
+const HEAP_SIZE: usize = 2 * 1024 * 1024;
+
+#[cfg(target_arch = "riscv64")]
+#[repr(align(4096))]
+struct DmaPool([u8; DMA_POOL_PAGES * DMA_PAGE_SIZE]);
+
+#[cfg(target_arch = "riscv64")]
+#[repr(align(4096))]
+struct KernelHeap([u8; HEAP_SIZE]);
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(link_section = ".bss.uninit")]
+static mut DMA_POOL: DmaPool = DmaPool([0; DMA_POOL_PAGES * DMA_PAGE_SIZE]);
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(link_section = ".bss.uninit")]
+static mut KERNEL_HEAP: KernelHeap = KernelHeap([0; HEAP_SIZE]);
+
+#[cfg(target_arch = "riscv64")]
+static DMA_NEXT_PAGE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_arch = "riscv64")]
+struct SimpleHal;
+
+#[cfg(target_arch = "riscv64")]
+impl Hal for SimpleHal {
+    fn dma_alloc(pages: usize) -> PhysAddr {
+        use core::sync::atomic::Ordering;
+
+        if pages == 0 {
+            return 0;
+        }
+
+        loop {
+            let current = DMA_NEXT_PAGE.load(Ordering::Relaxed);
+            let next = match current.checked_add(pages) {
+                Some(v) => v,
+                None => return 0,
+            };
+            if next > DMA_POOL_PAGES {
+                return 0;
+            }
+            if DMA_NEXT_PAGE
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                let base = unsafe { core::ptr::addr_of_mut!(DMA_POOL.0) as usize };
+                return base + current * DMA_PAGE_SIZE;
+            }
+        }
+    }
+
+    fn dma_dealloc(_paddr: PhysAddr, _pages: usize) -> i32 {
+        0
+    }
+
+    fn phys_to_virt(paddr: PhysAddr) -> VirtAddr {
+        paddr
+    }
+
+    fn virt_to_phys(vaddr: VirtAddr) -> PhysAddr {
+        vaddr
+    }
+}
 
 // ========== 启动相关 ==========
 
@@ -84,9 +174,49 @@ extern "C" fn rust_main() -> ! {
     tg_console::set_log_level(option_env!("LOG"));
     tg_console::test_log();
 
+    #[cfg(target_arch = "riscv64")]
+    init_allocator();
+
     // 第三步：初始化系统调用处理（注册 IO 和 Process 的实现）
     tg_syscall::init_io(&SyscallContext);
     tg_syscall::init_process(&SyscallContext);
+
+    #[cfg(target_arch = "riscv64")]
+    let (mut gpu, framebuffer_ptr, framebuffer_len, width, height) = {
+        let gpu_mmio = find_virtio_gpu_mmio().expect("virtio-gpu mmio not found");
+        let transport = unsafe {
+            MmioTransport::new(core::ptr::NonNull::new(gpu_mmio as *mut VirtIOHeader).unwrap())
+        }
+        .expect("failed to create MmioTransport");
+        let mut gpu = VirtIOGpu::<SimpleHal, MmioTransport>::new(transport)
+            .expect("failed to create VirtIOGpu");
+        let (width, height) = gpu
+            .resolution()
+            .expect("failed to query display resolution");
+        let width = width as usize;
+        let height = height as usize;
+        let (framebuffer_ptr, framebuffer_len, width, height) = {
+            let framebuffer = gpu
+                .setup_framebuffer()
+                .expect("failed to setup framebuffer");
+
+            let visible_len = width.saturating_mul(height).saturating_mul(4);
+            let framebuffer_len = framebuffer.len().min(visible_len);
+            clear_framebuffer(framebuffer, framebuffer_len, FRAMEBUFFER_BACKGROUND);
+            (framebuffer.as_mut_ptr(), framebuffer_len, width, height)
+        };
+        gpu.flush().expect("failed to flush framebuffer");
+        (
+            gpu,
+            framebuffer_ptr,
+            framebuffer_len,
+            width,
+            height,
+        )
+    };
+
+    #[cfg(target_arch = "riscv64")]
+    let mut rendered_blocks = 0usize;
 
     // 第四步：批处理——依次加载并运行每个用户程序
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
@@ -105,6 +235,9 @@ extern "C" fn rust_main() -> ! {
         // 将用户栈顶地址写入上下文的 sp 寄存器
         *ctx.sp_mut() = unsafe { user_stack_ptr.add(512) } as usize;
 
+        #[cfg(target_arch = "riscv64")]
+        let mut render_after_exit = false;
+
         // 循环执行用户程序，直到退出或出错
         loop {
             // execute() 会：
@@ -121,7 +254,13 @@ extern "C" fn rust_main() -> ! {
                     use SyscallResult::*;
                     match handle_syscall(&mut ctx) {
                         Done => continue,           // 系统调用处理完成，继续执行
-                        Exit(code) => log::info!("app{i} exit with code {code}"),
+                        Exit(code) => {
+                            log::info!("app{i} exit with code {code}");
+                            #[cfg(target_arch = "riscv64")]
+                            {
+                                render_after_exit = true;
+                            }
+                        }
                         Error(id) => {
                             log::error!("app{i} call an unsupported syscall {}", id.0)
                         }
@@ -135,13 +274,72 @@ extern "C" fn rust_main() -> ! {
             unsafe { core::arch::asm!("fence.i") };
             break;
         }
+
+        #[cfg(target_arch = "riscv64")]
+        if render_after_exit {
+            if rendered_blocks < tangram::BLOCK_COUNT {
+                let framebuffer = unsafe {
+                    core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len)
+                };
+                tangram::render_block(framebuffer, width, height, rendered_blocks);
+                gpu.flush().expect("failed to flush framebuffer");
+                rendered_blocks += 1;
+            }
+        }
+
         // 防止编译器优化掉 user_stack
         let _ = core::hint::black_box(&user_stack);
         println!();
     }
 
-    // 所有用户程序执行完毕，关机
-    tg_sbi::shutdown(false)
+    // 所有用户程序执行完毕后保持运行，保留最终画面供观察
+    wait_forever()
+}
+
+#[cfg(target_arch = "riscv64")]
+fn wait_forever() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn wait_forever() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn clear_framebuffer(framebuffer: &mut [u8], len: usize, color: u32) {
+    let pixel = color.to_le_bytes();
+    for chunk in framebuffer[..len].chunks_exact_mut(4) {
+        chunk.copy_from_slice(&pixel);
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn find_virtio_gpu_mmio() -> Option<usize> {
+    const VIRTIO_MAGIC: u32 = 0x7472_6976;
+    const DEVICE_ID_GPU: u32 = 16;
+    for slot in 0..VIRTIO_MMIO_COUNT {
+        let base = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
+        let magic = unsafe { (base as *const u32).read_volatile() };
+        let device_id = unsafe { ((base + 0x008) as *const u32).read_volatile() };
+        if magic == VIRTIO_MAGIC && device_id == DEVICE_ID_GPU {
+            return Some(base);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "riscv64")]
+fn init_allocator() {
+    let heap_ptr = unsafe { core::ptr::addr_of_mut!(KERNEL_HEAP.0) as *mut u8 };
+    tg_kernel_alloc::init(heap_ptr as usize);
+    unsafe {
+        tg_kernel_alloc::transfer(core::slice::from_raw_parts_mut(heap_ptr, HEAP_SIZE));
+    }
 }
 
 // ========== panic 处理 ==========
