@@ -46,9 +46,6 @@ use tg_sbi;
 use tg_syscall::{Caller, SyscallId};
 
 #[cfg(target_arch = "riscv64")]
-mod tangram;
-
-#[cfg(target_arch = "riscv64")]
 const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 
 #[cfg(target_arch = "riscv64")]
@@ -73,9 +70,6 @@ const HEAP_SIZE: usize = 2 * 1024 * 1024;
 const SYSCALL_RENDER_BLOCK: usize = 0x1000_0001;
 
 #[cfg(target_arch = "riscv64")]
-const NO_RENDER_REQUEST: usize = usize::MAX;
-
-#[cfg(target_arch = "riscv64")]
 #[repr(align(4096))]
 struct DmaPool([u8; DMA_POOL_PAGES * DMA_PAGE_SIZE]);
 
@@ -94,10 +88,6 @@ static mut KERNEL_HEAP: KernelHeap = KernelHeap([0; HEAP_SIZE]);
 #[cfg(target_arch = "riscv64")]
 static DMA_NEXT_PAGE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(target_arch = "riscv64")]
-static RENDER_REQUEST: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(NO_RENDER_REQUEST);
 
 #[cfg(target_arch = "riscv64")]
 struct SimpleHal;
@@ -216,13 +206,7 @@ extern "C" fn rust_main() -> ! {
             (framebuffer.as_mut_ptr(), framebuffer_len, width, height)
         };
         gpu.flush().expect("failed to flush framebuffer");
-        (
-            gpu,
-            framebuffer_ptr,
-            framebuffer_len,
-            width,
-            height,
-        )
+        (gpu, framebuffer_ptr, framebuffer_len, width, height)
     };
 
     // 第四步：批处理——依次加载并运行每个用户程序
@@ -255,6 +239,15 @@ extern "C" fn rust_main() -> ! {
             match scause::read().cause() {
                 // 用户态系统调用（ecall from U-mode）
                 Trap::Exception(Exception::UserEnvCall) => {
+                    #[cfg(target_arch = "riscv64")]
+                    {
+                        let framebuffer =
+                            unsafe { core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len) };
+                        if handle_render_syscall(&mut ctx, framebuffer, width, height, &mut gpu) {
+                            continue;
+                        }
+                    }
+
                     use SyscallResult::*;
                     match handle_syscall(&mut ctx) {
                         Done => continue,           // 系统调用处理完成，继续执行
@@ -273,18 +266,6 @@ extern "C" fn rust_main() -> ! {
             // 需要确保 i-cache 中不会残留旧的指令
             unsafe { core::arch::asm!("fence.i") };
             break;
-        }
-
-        #[cfg(target_arch = "riscv64")]
-        {
-            use core::sync::atomic::Ordering;
-            let block = RENDER_REQUEST.swap(NO_RENDER_REQUEST, Ordering::AcqRel);
-            if block < tangram::BLOCK_COUNT {
-                let framebuffer =
-                    unsafe { core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len) };
-                tangram::render_block(framebuffer, width, height, block);
-                gpu.flush().expect("failed to flush framebuffer");
-            }
         }
 
         // 防止编译器优化掉 user_stack
@@ -370,19 +351,6 @@ enum SyscallResult {
 fn handle_syscall(ctx: &mut LocalContext) -> SyscallResult {
     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
 
-    #[cfg(target_arch = "riscv64")]
-    {
-        use core::sync::atomic::Ordering;
-        let id_raw = ctx.a(7);
-        if id_raw == SYSCALL_RENDER_BLOCK {
-            let block = ctx.a(0);
-            RENDER_REQUEST.store(block, Ordering::Release);
-            *ctx.a_mut(0) = 0;
-            ctx.move_next();
-            return SyscallResult::Done;
-        }
-    }
-
     // a7 寄存器存放 syscall ID
     let id = ctx.a(7).into();
     // a0-a5 寄存器存放系统调用参数
@@ -401,6 +369,86 @@ fn handle_syscall(ctx: &mut LocalContext) -> SyscallResult {
         },
         Ret::Unsupported(id) => SyscallResult::Error(id),
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn handle_render_syscall(
+    ctx: &mut LocalContext,
+    framebuffer: &mut [u8],
+    dst_width: usize,
+    dst_height: usize,
+    gpu: &mut VirtIOGpu<SimpleHal, MmioTransport>,
+) -> bool {
+    let id_raw = ctx.a(7);
+    if id_raw != SYSCALL_RENDER_BLOCK {
+        return false;
+    }
+
+    let user_fb_ptr = ctx.a(0) as *const u8;
+    let user_fb_len = ctx.a(1);
+    let src_width = ctx.a(2);
+    let src_height = ctx.a(3);
+
+    let mut ret = -1isize;
+    if !user_fb_ptr.is_null() && src_width > 0 && src_height > 0 {
+        let src_bytes = src_width
+            .checked_mul(src_height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .unwrap_or(0);
+        if src_bytes > 0
+            && src_bytes <= user_fb_len
+            && src_width <= dst_width
+            && src_height <= dst_height
+        {
+            log::info!(
+                "render syscall: src={}x{}, bytes={}",
+                src_width,
+                src_height,
+                src_bytes
+            );
+            let user_fb = unsafe { core::slice::from_raw_parts(user_fb_ptr, src_bytes) };
+            let offset_x = (dst_width - src_width) / 2;
+            let offset_y = (dst_height - src_height) / 2;
+
+            for y in 0..src_height {
+                let src_row = &user_fb[y * src_width * 4..(y + 1) * src_width * 4];
+                let dst_row_start = ((y + offset_y) * dst_width + offset_x) * 4;
+                let dst_row_end = dst_row_start + src_width * 4;
+                let dst_row = &mut framebuffer[dst_row_start..dst_row_end];
+
+                for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                    if src[3] != 0 {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+            if gpu.flush().is_ok() {
+                ret = 0;
+            } else {
+                log::error!("render syscall: gpu flush failed");
+            }
+        } else {
+            log::error!(
+                "render syscall invalid args: len={}, src={}x{}, dst={}x{}",
+                user_fb_len,
+                src_width,
+                src_height,
+                dst_width,
+                dst_height
+            );
+        }
+    } else {
+        log::error!(
+            "render syscall null/zero args: ptr={:#x}, src={}x{}",
+            user_fb_ptr as usize,
+            src_width,
+            src_height
+        );
+    }
+
+    *ctx.a_mut(0) = ret as usize;
+    ctx.move_next();
+    true
 }
 
 // ========== 接口实现 ==========
