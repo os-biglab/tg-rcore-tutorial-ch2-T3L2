@@ -1,7 +1,7 @@
 [package]
 name = "tg-rcore-tutorial-ch2-T3L2"
 description = "ch2-T3L2: Chapter 2 of rCore Tutorial: Dynamic step-by-step tangram OS rendering with batch user programs."
-version = "0.0.1-preview.2"
+version = "0.0.1-preview.3"
 edition = "2024"
 authors = ["Feiran Qin <qfr23@mails.tsinghua.edu.cn>"]
 repository = "https://github.com/os-biglab/tg-rcore-tutorial-ch2-T3L2"
