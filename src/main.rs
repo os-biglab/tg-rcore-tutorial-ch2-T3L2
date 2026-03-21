@@ -400,12 +400,6 @@ fn handle_render_syscall(
             && src_width <= dst_width
             && src_height <= dst_height
         {
-            log::info!(
-                "render syscall: src={}x{}, bytes={}",
-                src_width,
-                src_height,
-                src_bytes
-            );
             let user_fb = unsafe { core::slice::from_raw_parts(user_fb_ptr, src_bytes) };
             let offset_x = (dst_width - src_width) / 2;
             let offset_y = (dst_height - src_height) / 2;
@@ -417,9 +411,13 @@ fn handle_render_syscall(
                 let dst_row = &mut framebuffer[dst_row_start..dst_row_end];
 
                 for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
-                    if src[3] != 0 {
-                        dst.copy_from_slice(src);
+                    if src[3] == 0 {
+                        continue;
                     }
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = 0xff;
                 }
             }
             if gpu.flush().is_ok() {

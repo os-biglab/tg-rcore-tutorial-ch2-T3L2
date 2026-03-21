@@ -100,6 +100,8 @@ fn build_apps() {
 
 fn build_user_app(tg_user_root: &PathBuf, name: &str, base_address: u64) {
     let mut cmd = Command::new("cargo");
+    cmd.current_dir(tg_user_root);
+    cmd.env_remove("CARGO_TARGET_DIR");
     cmd.args([
         "build",
         "--manifest-path",
