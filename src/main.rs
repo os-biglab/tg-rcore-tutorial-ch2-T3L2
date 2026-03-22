@@ -67,7 +67,10 @@ const FRAMEBUFFER_BACKGROUND: u32 = 0xff1d2128;
 const HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 #[cfg(target_arch = "riscv64")]
-const SYSCALL_RENDER_BLOCK: usize = 0x1000_0001;
+const SYSCALL_FRAMEBUFFER: usize = 0x1000_0001;
+
+#[cfg(target_arch = "riscv64")]
+const SYSCALL_FRAMEBUFFER_FLUSH: usize = 0x1000_0002;
 
 #[cfg(target_arch = "riscv64")]
 #[repr(align(4096))]
@@ -241,9 +244,14 @@ extern "C" fn rust_main() -> ! {
                 Trap::Exception(Exception::UserEnvCall) => {
                     #[cfg(target_arch = "riscv64")]
                     {
-                        let framebuffer =
-                            unsafe { core::slice::from_raw_parts_mut(framebuffer_ptr, framebuffer_len) };
-                        if handle_render_syscall(&mut ctx, framebuffer, width, height, &mut gpu) {
+                        if handle_gpu_syscall(
+                            &mut ctx,
+                            framebuffer_ptr as usize,
+                            framebuffer_len,
+                            width,
+                            height,
+                            &mut gpu,
+                        ) {
                             continue;
                         }
                     }
@@ -372,81 +380,36 @@ fn handle_syscall(ctx: &mut LocalContext) -> SyscallResult {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn handle_render_syscall(
+fn handle_gpu_syscall(
     ctx: &mut LocalContext,
-    framebuffer: &mut [u8],
+    framebuffer_ptr: usize,
+    framebuffer_len: usize,
     dst_width: usize,
     dst_height: usize,
     gpu: &mut VirtIOGpu<SimpleHal, MmioTransport>,
 ) -> bool {
-    let id_raw = ctx.a(7);
-    if id_raw != SYSCALL_RENDER_BLOCK {
-        return false;
-    }
-
-    let user_fb_ptr = ctx.a(0) as *const u8;
-    let user_fb_len = ctx.a(1);
-    let src_width = ctx.a(2);
-    let src_height = ctx.a(3);
-
-    let mut ret = -1isize;
-    if !user_fb_ptr.is_null() && src_width > 0 && src_height > 0 {
-        let src_bytes = src_width
-            .checked_mul(src_height)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .unwrap_or(0);
-        if src_bytes > 0
-            && src_bytes <= user_fb_len
-            && src_width <= dst_width
-            && src_height <= dst_height
-        {
-            let user_fb = unsafe { core::slice::from_raw_parts(user_fb_ptr, src_bytes) };
-            let offset_x = (dst_width - src_width) / 2;
-            let offset_y = (dst_height - src_height) / 2;
-
-            for y in 0..src_height {
-                let src_row = &user_fb[y * src_width * 4..(y + 1) * src_width * 4];
-                let dst_row_start = ((y + offset_y) * dst_width + offset_x) * 4;
-                let dst_row_end = dst_row_start + src_width * 4;
-                let dst_row = &mut framebuffer[dst_row_start..dst_row_end];
-
-                for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
-                    if src[3] == 0 {
-                        continue;
-                    }
-                    dst[0] = src[2];
-                    dst[1] = src[1];
-                    dst[2] = src[0];
-                    dst[3] = 0xff;
-                }
-            }
-            if gpu.flush().is_ok() {
-                ret = 0;
-            } else {
-                log::error!("render syscall: gpu flush failed");
-            }
-        } else {
-            log::error!(
-                "render syscall invalid args: len={}, src={}x{}, dst={}x{}",
-                user_fb_len,
-                src_width,
-                src_height,
-                dst_width,
-                dst_height
-            );
+    match ctx.a(7) {
+        SYSCALL_FRAMEBUFFER => {
+            *ctx.a_mut(0) = framebuffer_ptr;
+            *ctx.a_mut(1) = framebuffer_len;
+            *ctx.a_mut(2) = dst_width;
+            *ctx.a_mut(3) = dst_height;
+            ctx.move_next();
+            true
         }
-    } else {
-        log::error!(
-            "render syscall null/zero args: ptr={:#x}, src={}x{}",
-            user_fb_ptr as usize,
-            src_width,
-            src_height
-        );
+        SYSCALL_FRAMEBUFFER_FLUSH => {
+            let ret = if gpu.flush().is_ok() {
+                0
+            } else {
+                log::error!("framebuffer flush syscall: gpu flush failed");
+                -1
+            };
+            *ctx.a_mut(0) = ret as usize;
+            ctx.move_next();
+            true
+        }
+        _ => false,
     }
-
-    *ctx.a_mut(0) = ret as usize;
-    ctx.move_next();
-    true
 }
 
 // ========== 接口实现 ==========
