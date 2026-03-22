@@ -9,6 +9,7 @@ Implemented target behavior:
 - Tangram data organized by blocks, not as a monolithic image.
 - Execution remains in S-mode/U-mode split of chapter-2.
 - Global static storage for rendering data to avoid large stack pressure.
+- User programs write directly into the mapped VirtIO-GPU framebuffer; the kernel only provides framebuffer metadata and flush service.
 
 ## 2. Implementation Summary
 
@@ -20,6 +21,7 @@ Implemented target behavior:
 - User crate (`tg-rcore-tutorial-user-T3L2`):
   - Package metadata updated to T3L2 naming/version.
   - Added local `[workspace]` section for independent build by kernel build script.
+  - Uses the new framebuffer query syscall to obtain the mapped framebuffer pointer, then renders in place and calls the flush syscall.
 
 ## 2.2 Build/Runner Integration
 
@@ -35,10 +37,13 @@ Implemented target behavior:
 2. Construct `MmioTransport`.
 3. Construct `VirtIOGpu::<SimpleHal, MmioTransport>`.
 4. `setup_framebuffer`, clear background, initial `flush`.
-5. After each app exits:
-   - call `render_block(..., rendered_blocks)`
-   - call `gpu.flush()`
-   - increment step counter.
+5. Expose framebuffer access to user programs through syscalls:
+  - `SYSCALL_FRAMEBUFFER` returns framebuffer pointer, length, width, and height.
+  - `SYSCALL_FRAMEBUFFER_FLUSH` flushes GPU updates after user-space drawing.
+6. After each app exits:
+  - the next user step draws directly into the mapped framebuffer,
+  - then explicitly requests `gpu.flush()` via syscall,
+  - increment step counter.
 
 ## 2.4 Tangram Block Renderer
 
@@ -46,6 +51,7 @@ Implemented target behavior:
 - Piece data is decomposed into indexed blocks.
 - Renderer writes BGRA pixels in framebuffer.
 - Per-step rendering composes full `OS` progressively.
+- The actual drawing happens in user space against the shared framebuffer mapping; the kernel no longer copies a user framebuffer into the GPU framebuffer.
 
 ## 3. Key Bug and Root Cause
 
@@ -83,3 +89,4 @@ CH2-T3L2 now satisfies the dynamic batch tangram requirement:
 - Stable batch execution.
 - Stable per-step GPU flush.
 - Block-based tangram composition pipeline fully functional.
+- User-space direct framebuffer rendering avoids the extra copy from user buffer to kernel framebuffer.

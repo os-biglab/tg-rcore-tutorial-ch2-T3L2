@@ -8,6 +8,7 @@ CH2-T3L2 extends the chapter-2 batch OS to support **dynamic, step-by-step tangr
 - User apps run in U-mode and execute in batch order.
 - Each user app corresponds to one tangram block update.
 - Tangram block data is globally stored in kernel static data.
+- User apps obtain the framebuffer pointer through a syscall and write directly into the GPU framebuffer mapping.
 
 ## 2. Runtime Pipeline
 
@@ -21,7 +22,8 @@ CH2-T3L2 extends the chapter-2 batch OS to support **dynamic, step-by-step tangr
 8. Iterate user apps in batch mode:
    - Load app to fixed address.
    - Run app in U-mode via `LocalContext::user`.
-   - On `exit`, render exactly one tangram block and `flush`.
+  - On `exit`, the user program has already drawn one tangram block directly into the mapped framebuffer.
+  - User program then requests a framebuffer flush through syscall.
 9. Enter idle wait (no shutdown) when all apps finish, keeping the final frame visible.
 
 ## 3. Core Modules
@@ -31,6 +33,7 @@ CH2-T3L2 extends the chapter-2 batch OS to support **dynamic, step-by-step tangr
 - Kernel boot path and batch scheduler loop.
 - Trap/syscall handling (`UserEnvCall` path).
 - VirtIO-GPU initialization and per-step flush.
+- Framebuffer query/flush syscalls that expose the mapped GPU framebuffer to user space.
 - DMA HAL implementation (`SimpleHal`) and static DMA pool.
 - Kernel allocator bootstrap (`tg-kernel-alloc`).
 
@@ -52,7 +55,7 @@ CH2-T3L2 extends the chapter-2 batch OS to support **dynamic, step-by-step tangr
 ## 5. Data & Control Separation
 
 - **Control plane**: batch loop + trap handling + syscall dispatch.
-- **Render plane**: framebuffer writes + GPU `flush`.
+- **Render plane**: user-space framebuffer writes + GPU `flush`.
 - **Data plane**: static tangram block descriptors and transform parameters.
 
 This separation keeps per-app logic simple while ensuring deterministic visual progression.
